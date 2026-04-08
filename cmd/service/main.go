@@ -59,7 +59,10 @@ func main() {
 		otelProvider.Tracer, otelProvider.Metrics)
 
 	// ── Kafka reader ───────────────────────────────────────────────────────────
-	reader := kafkapkg.NewReader(cfg, otelProvider.Tracer, otelProvider.Metrics)
+	reader, err := kafkapkg.NewReader(cfg, otelProvider.Tracer, otelProvider.Metrics)
+	if err != nil {
+		log.Fatalf("kafka init: %v", err)
+	}
 
 	// ── Write service ──────────────────────────────────────────────────────────
 	svc := service.New(cfg, reader, buf, w, s3Client, dc, otelProvider.Metrics, otelProvider.Tracer)
@@ -77,8 +80,8 @@ func main() {
 		}
 	}()
 
-	log.Printf("  write-service started — instance=%s http=:%d kafka=%s",
-		cfg.InstanceID, cfg.HTTPPort, cfg.KafkaBroker)
+	log.Printf("  write-service started — instance=%s http=:%d kafka=%v",
+		cfg.InstanceID, cfg.HTTPPort, cfg.KafkaBootstrapServers)
 
 	// ── Graceful shutdown ──────────────────────────────────────────────────────
 	quit := make(chan os.Signal, 1)

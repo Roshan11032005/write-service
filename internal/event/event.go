@@ -1,16 +1,6 @@
 
 package event
 
-
-type KafkaEnvelope struct {
-	EventID     string `json:"_event_id"`
-	EventTS     string `json:"_event_timestamp"`
-	Category    string `json:"_category"`
-	EventType   string `json:"_event_type"`
-	ReferenceID string `json:"reference_id"`
-}
-
-
 type Event struct {
 	EventID     string `json:"event_id"`
 	ReferenceID string `json:"reference_id"`

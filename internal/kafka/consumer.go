@@ -1,17 +1,15 @@
-// Package kafka wraps segmentio/kafka-go to provide a typed consumer that
+// Package kafka wraps confluent-kafka-go to provide a typed consumer that
 // emits parsed events to the rest of the service.
 package kafka
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"log"
 	"time"
 
-	kgo "github.com/segmentio/kafka-go"
+	ckafka "github.com/confluentinc/confluent-kafka-go/kafka"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
@@ -19,42 +17,43 @@ import (
 
 	"write-service/config"
 	"write-service/internal/event"
+	"write-service/kafkautil"
+	"write-service/model"
 	appmetrics "write-service/internal/otel"
 )
 
-// Reader wraps a kafka-go reader.
+// Reader wraps a confluent-kafka-go consumer.
 type Reader struct {
-	r       *kgo.Reader
-	cfg     *config.Config
-	tracer  trace.Tracer
-	metrics *appmetrics.Metrics
+	consumer *ckafka.Consumer
+	cfg      *config.Config
+	tracer   trace.Tracer
+	metrics  *appmetrics.Metrics
 }
 
-// NewReader creates and configures a kafka-go Reader.
-func NewReader(cfg *config.Config, tracer trace.Tracer, metrics *appmetrics.Metrics) *Reader {
-	r := kgo.NewReader(kgo.ReaderConfig{
-		Brokers:        []string{cfg.KafkaBroker},
-		Topic:          cfg.KafkaTopic,
-		GroupID:        cfg.KafkaGroupID,
-		MinBytes:       10e3,
-		MaxBytes:       10e6,
-		MaxWait:        100 * time.Millisecond,
-		CommitInterval: 0,
-		StartOffset:    kgo.FirstOffset,
-		QueueCapacity:  1000,
-		ErrorLogger: kgo.LoggerFunc(func(s string, a ...interface{}) {
-			log.Printf("[kafka] "+s, a...)
-		}),
+// NewReader creates and configures a confluent-kafka-go consumer.
+func NewReader(cfg *config.Config, tracer trace.Tracer, metrics *appmetrics.Metrics) (*Reader, error) {
+	consumer, err := kafkautil.CreateConsumer(&model.KafkaConfig{
+		BootstrapServers: cfg.KafkaBootstrapServers,
+		GroupId:          cfg.KafkaGroupID,
+		AutoOffsetReset:  cfg.KafkaAutoOffsetReset,
 	})
+	if err != nil {
+		return nil, fmt.Errorf("kafka consumer: %w", err)
+	}
 
-	log.Printf("[kafka] reader ready — broker=%s topic=%s group=%s",
-		cfg.KafkaBroker, cfg.KafkaTopic, cfg.KafkaGroupID)
+	if err := consumer.SubscribeTopics([]string{cfg.KafkaTopic}, nil); err != nil {
+		consumer.Close()
+		return nil, fmt.Errorf("kafka subscribe: %w", err)
+	}
 
-	return &Reader{r: r, cfg: cfg, tracer: tracer, metrics: metrics}
+	log.Printf("[kafka] reader ready — brokers=%v topic=%s group=%s",
+		cfg.KafkaBootstrapServers, cfg.KafkaTopic, cfg.KafkaGroupID)
+
+	return &Reader{consumer: consumer, cfg: cfg, tracer: tracer, metrics: metrics}, nil
 }
 
-// Close shuts the underlying kafka-go reader down.
-func (r *Reader) Close() { r.r.Close() }
+// Close shuts the underlying confluent-kafka-go consumer down.
+func (r *Reader) Close() { r.consumer.Close() }
 
 // FetchBatch reads up to maxMessages from Kafka, parses them into Events, and
 // deduplicates using the provided function.
@@ -63,23 +62,15 @@ func (r *Reader) FetchBatch(
 	ctx context.Context,
 	maxMessages int,
 	isDuplicate func(ctx context.Context, eventID string, ts int64) bool,
-) (events []event.Event, msgs []kgo.Message, duplicates int, err error) {
-	fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-
+) (events []event.Event, msgs []*ckafka.Message, duplicates int, err error) {
 	fetchStart := time.Now()
-	raw, fetchErr := r.fetchRaw(fetchCtx, maxMessages)
+	raw, fetchErr := r.fetchRaw(ctx, maxMessages)
 	elapsed := time.Since(fetchStart).Seconds()
 
 	r.metrics.KafkaFetchDuration.Record(ctx, elapsed,
 		metric.WithAttributes(attribute.Int("batch.size", len(raw))))
 
 	if fetchErr != nil {
-		if errors.Is(fetchErr, context.DeadlineExceeded) ||
-			errors.Is(fetchErr, context.Canceled) ||
-			errors.Is(fetchErr, io.EOF) {
-			return nil, nil, 0, nil
-		}
 		return nil, nil, 0, fmt.Errorf("kafka fetch: %w", fetchErr)
 	}
 	if len(raw) == 0 {
@@ -111,30 +102,60 @@ func (r *Reader) FetchBatch(
 	return events, msgs, duplicates, nil
 }
 
-// CommitMessages commits a slice of raw kafka messages.
-func (r *Reader) CommitMessages(ctx context.Context, msgs []kgo.Message) error {
-	return r.r.CommitMessages(ctx, msgs...)
+// CommitMessages commits offsets for a slice of consumed messages.
+func (r *Reader) CommitMessages(ctx context.Context, msgs []*ckafka.Message) error {
+	offsets := make([]ckafka.TopicPartition, len(msgs))
+	for i, msg := range msgs {
+		offsets[i] = ckafka.TopicPartition{
+			Topic:     msg.TopicPartition.Topic,
+			Partition: msg.TopicPartition.Partition,
+			Offset:    msg.TopicPartition.Offset + 1,
+		}
+	}
+	_, err := r.consumer.CommitOffsets(offsets)
+	return err
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-func (r *Reader) fetchRaw(ctx context.Context, max int) ([]kgo.Message, error) {
-	msgs := make([]kgo.Message, 0, max)
+func (r *Reader) fetchRaw(ctx context.Context, max int) ([]*ckafka.Message, error) {
+	msgs := make([]*ckafka.Message, 0, max)
+	deadline := time.Now().Add(2 * time.Second)
+
 	for i := 0; i < max; i++ {
-		msg, err := r.r.FetchMessage(ctx)
-		if err != nil {
-			if len(msgs) > 0 {
-				return msgs, nil
-			}
-			return nil, err
-		}
-		msgs = append(msgs, msg)
 		select {
 		case <-ctx.Done():
 			return msgs, nil
 		default:
 		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return msgs, nil
+		}
+
+		ev := r.consumer.Poll(int(remaining.Milliseconds()))
+		if ev == nil {
+			return msgs, nil
+		}
+
+		switch e := ev.(type) {
+		case *ckafka.Message:
+			if e.TopicPartition.Error != nil {
+				if len(msgs) > 0 {
+					return msgs, nil
+				}
+				return nil, e.TopicPartition.Error
+			}
+			msgs = append(msgs, e)
+		case ckafka.Error:
+			if len(msgs) > 0 {
+				return msgs, nil
+			}
+			return nil, e
+		}
 	}
+
 	return msgs, nil
 }
 
@@ -143,35 +164,38 @@ func parseMessage(ctx context.Context, raw []byte, tracer trace.Tracer) (event.E
 		trace.WithAttributes(attribute.Int("message.bytes", len(raw))))
 	defer span.End()
 
-	var env event.KafkaEnvelope
-	if err := json.Unmarshal(raw, &env); err != nil {
+	var authEvent model.AuthTranEvent
+	if err := json.Unmarshal(raw, &authEvent); err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "invalid JSON")
 		return event.Event{}, fmt.Errorf("invalid JSON: %w", err)
 	}
 
 	switch {
-	case env.EventID == "":
+	case authEvent.EventID == "":
 		return event.Event{}, fmt.Errorf("missing _event_id")
-	case env.ReferenceID == "":
-		return event.Event{}, fmt.Errorf("missing reference_id")
-	case env.EventTS == "":
+	case authEvent.EventTimestamp == "":
 		return event.Event{}, fmt.Errorf("missing _event_timestamp")
 	}
 
-	ts, err := parseTimestamp(env.EventTS)
+	ts, err := parseTimestamp(authEvent.EventTimestamp)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "invalid timestamp")
 		return event.Event{}, fmt.Errorf("invalid _event_timestamp: %w", err)
 	}
 
+	referenceID := ""
+	if authEvent.Data != nil {
+		referenceID = authEvent.Data.HashUID
+	}
+
 	e := event.Event{
-		EventID:     env.EventID,
-		ReferenceID: env.ReferenceID,
+		EventID:     authEvent.EventID,
+		ReferenceID: referenceID,
 		Timestamp:   ts,
-		Category:    env.Category,
-		EventType:   env.EventType,
+		Category:    authEvent.Category,
+		EventType:   authEvent.EventType,
 		Payload:     raw,
 	}
 

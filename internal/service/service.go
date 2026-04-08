@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	kgo "github.com/segmentio/kafka-go"
+	ckafka "github.com/confluentinc/confluent-kafka-go/kafka"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -200,7 +200,7 @@ func (s *WriteService) consumerLoop(id int) {
 	defer s.wg.Done()
 	log.Printf("[service] consumer #%d started", id)
 
-	var pending []kgo.Message
+	var pending []*ckafka.Message
 
 	for {
 		select {

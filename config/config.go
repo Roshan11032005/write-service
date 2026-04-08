@@ -21,11 +21,12 @@ type Config struct {
 	InstanceID string
 
 	// Kafka
-	KafkaBroker      string
-	KafkaTopic       string
-	KafkaGroupID     string
-	KafkaBatchSize   int
-	KafkaCommitBatch int
+	KafkaBootstrapServers []string
+	KafkaTopic            string
+	KafkaGroupID          string
+	KafkaAutoOffsetReset  string
+	KafkaBatchSize        int
+	KafkaCommitBatch      int
 
 	// Buffer
 	BufferLimit     int
@@ -72,11 +73,12 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		InstanceID: instanceID,
 
-		KafkaBroker:      envStr("KAFKA_BROKER", "localhost:9092"),
-		KafkaTopic:       envStr("KAFKA_TOPIC", "events"),
-		KafkaGroupID:     envStr("KAFKA_GROUP_ID", "write-service-group"),
-		KafkaBatchSize:   envInt("KAFKA_BATCH_SIZE", 100),
-		KafkaCommitBatch: envInt("KAFKA_COMMIT_BATCH", 500),
+		KafkaBootstrapServers: envStrSlice("KAFKA_BOOTSTRAP_SERVERS", []string{"localhost:9092"}),
+		KafkaTopic:            envStr("KAFKA_TOPIC", "events"),
+		KafkaGroupID:          envStr("KAFKA_GROUP_ID", "write-service-group"),
+		KafkaAutoOffsetReset:  envStr("KAFKA_AUTO_OFFSET_RESET", "earliest"),
+		KafkaBatchSize:        envInt("KAFKA_BATCH_SIZE", 100),
+		KafkaCommitBatch:      envInt("KAFKA_COMMIT_BATCH", 500),
 
 		BufferLimit:     envInt("BUFFER_LIMIT", 10_000),
 		BufferSizeLimit: envInt64("BUFFER_SIZE_LIMIT", 20*1024*1024),
@@ -103,8 +105,8 @@ func Load() (*Config, error) {
 		OTELServiceVersion: envStr("OTEL_SERVICE_VERSION", "1.0.0"),
 	}
 
-	log.Printf("[config] instance=%s kafka=%s topic=%s consumers=%d http=%d",
-		cfg.InstanceID, cfg.KafkaBroker, cfg.KafkaTopic, cfg.NumConsumers, cfg.HTTPPort)
+	log.Printf("[config] instance=%s kafka=%v topic=%s consumers=%d http=%d",
+		cfg.InstanceID, cfg.KafkaBootstrapServers, cfg.KafkaTopic, cfg.NumConsumers, cfg.HTTPPort)
 
 	return cfg, nil
 }
@@ -193,6 +195,18 @@ func envDuration(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+func envStrSlice(key string, def []string) []string {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	parts := strings.Split(v, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
 }
 
 func envBool(key string, def bool) bool {
